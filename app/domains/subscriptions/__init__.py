@@ -1,0 +1,1 @@
+"""Subscriptions domain (M11)."""

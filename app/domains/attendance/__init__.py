@@ -1,0 +1,1 @@
+"""Attendance domain (M4)."""

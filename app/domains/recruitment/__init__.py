@@ -1,0 +1,1 @@
+"""Recruitment domain (M9)."""
