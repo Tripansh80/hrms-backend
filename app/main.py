@@ -19,6 +19,8 @@ from app.domains.attendance.router import router as attendance_router
 from app.domains.audit.router import router as audit_router
 from app.domains.auth.router import router as auth_router
 from app.domains.documents.router import router as documents_router
+from app.domains.directory.router import router as directory_router
+from app.domains.dashboards.router import router as dashboards_router
 from app.domains.employees.router import router as employees_router
 from app.domains.imports.router import router as imports_router
 from app.domains.leave.router import router as leave_router
@@ -50,6 +52,8 @@ DOMAIN_ROUTERS = [
     imports_router,
     recruitment_router,
     documents_router,
+    directory_router,
+    dashboards_router,
     policies_router,
     ai_router,
     subscriptions_router,

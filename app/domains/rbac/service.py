@@ -176,7 +176,7 @@ async def delete_role(db: AsyncSession, ctx: RequestContext, role_id: uuid.UUID)
             if system:
                 raise Forbidden("System roles are read-only", code="role.system_read_only")
             raise NotFound("Role not found", code="role.not_found")
-        owner = await db.scalar(text("SELECT id FROM roles WHERE tenant_id IS NULL AND name='Tenant Owner'"))
+        owner = await db.scalar(text("SELECT id FROM roles WHERE tenant_id IS NULL AND name='Admin'"))
         assigned = await db.scalar(
             text(
                 "SELECT EXISTS(SELECT 1 FROM user_roles WHERE tenant_id=:tid AND role_id=:rid AND role_id=:owner)"
@@ -189,7 +189,7 @@ async def delete_role(db: AsyncSession, ctx: RequestContext, role_id: uuid.UUID)
                 {"tid": ctx.tenant_id, "owner": owner},
             )
             if remaining <= 1:
-                raise Conflict("The last Tenant Owner cannot be removed", code="role.last_owner")
+                raise Conflict("The last Admin cannot be removed", code="role.last_admin")
         affected = (
             (
                 await db.execute(
@@ -353,7 +353,7 @@ async def set_user_roles(
             raise Forbidden(
                 "You cannot grant a role with permissions you do not hold", code="role.permission_escalation"
             )
-        owner = await db.scalar(text("SELECT id FROM roles WHERE tenant_id IS NULL AND name='Tenant Owner'"))
+        owner = await db.scalar(text("SELECT id FROM roles WHERE tenant_id IS NULL AND name='Admin'"))
         was_owner = await db.scalar(
             text(
                 "SELECT EXISTS(SELECT 1 FROM user_roles WHERE tenant_id=:tid AND user_id=:uid AND role_id=:owner)"
@@ -367,7 +367,7 @@ async def set_user_roles(
                 {"tid": ctx.tenant_id, "owner": owner},
             )
             if count <= 1:
-                raise Conflict("The last Tenant Owner cannot be removed", code="role.last_owner")
+                raise Conflict("The last Admin cannot be removed", code="role.last_admin")
         before = (
             (
                 await db.execute(

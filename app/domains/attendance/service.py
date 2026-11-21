@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.context import RequestContext
 from app.core.errors import Conflict, Forbidden, NotFound, ValidationFailed
+from app.core.permissions import DataScope, resolve_scope, scope_filter
 from app.domains.attendance.schemas import parse_month
 
 
@@ -164,31 +165,13 @@ async def list_attendance(
     start, end = parse_month(month)
     ctx.require("attendance.read")
     async with db.begin():
-        scopes = (
-            (
-                await db.execute(
-                    text("""SELECT r.data_scope FROM user_roles ur JOIN roles r ON r.id=ur.role_id
-            JOIN role_permissions rp ON rp.role_id=r.id JOIN permissions p ON p.id=rp.permission_id
-            WHERE ur.tenant_id=:tid AND ur.user_id=:uid AND p.code='attendance.read'"""),
-                    {"tid": ctx.tenant_id, "uid": ctx.user_id},
-                )
-            )
-            .scalars()
-            .all()
-        )
-        scope = max(scopes, key={"self": 1, "team": 2, "department": 3, "all": 4}.get) if scopes else "self"
-        clauses = {
-            "all": "TRUE",
-            "self": "e.user_id=:uid",
-            "team": "e.id IN (WITH RECURSIVE team(id) AS (SELECT id FROM employees WHERE tenant_id=:tid AND user_id=:uid AND deleted_at IS NULL UNION ALL SELECT e2.id FROM employees e2 JOIN team t ON e2.manager_id=t.id WHERE e2.tenant_id=:tid AND e2.deleted_at IS NULL) SELECT id FROM team)",
-            "department": "e.department_id IN (WITH RECURSIVE dept(id) AS (SELECT department_id FROM employees WHERE tenant_id=:tid AND user_id=:uid AND deleted_at IS NULL UNION ALL SELECT d.id FROM departments d JOIN dept x ON d.parent_id=x.id WHERE d.tenant_id=:tid AND d.deleted_at IS NULL) SELECT id FROM dept)",
-        }
+        scope = await resolve_scope(db, ctx, "attendance.read") or DataScope.SELF
         rows = (
             (
                 await db.execute(
                     text(f"""SELECT a.*,e.employee_no,e.first_name,e.last_name FROM attendance_records a
             JOIN employees e ON e.tenant_id=a.tenant_id AND e.id=a.employee_id
-            WHERE a.tenant_id=:tid AND a.work_date>=:start AND a.work_date<:end AND {clauses[scope]}
+            WHERE a.tenant_id=:tid AND a.work_date>=:start AND a.work_date<:end AND {scope_filter(scope)}
             AND (:cursor IS NULL OR (a.work_date,a.id)>(SELECT work_date,id FROM attendance_records WHERE tenant_id=:tid AND id=:cursor))
             ORDER BY a.work_date,a.id LIMIT :limit"""),
                     {
@@ -214,25 +197,8 @@ async def summary(db: AsyncSession, ctx: RequestContext, month: str) -> dict:
     ctx.require("attendance.read")
     start, end = parse_month(month)
     async with db.begin():
-        scopes = (
-            (
-                await db.execute(
-                    text("""SELECT r.data_scope FROM user_roles ur JOIN roles r ON r.id=ur.role_id
-            JOIN role_permissions rp ON rp.role_id=r.id JOIN permissions p ON p.id=rp.permission_id
-            WHERE ur.tenant_id=:tid AND ur.user_id=:uid AND p.code='attendance.read'"""),
-                    {"tid": ctx.tenant_id, "uid": ctx.user_id},
-                )
-            )
-            .scalars()
-            .all()
-        )
-        scope = max(scopes, key={"self": 1, "team": 2, "department": 3, "all": 4}.get) if scopes else "self"
-        scope_clause = {
-            "all": "TRUE",
-            "self": "e.user_id=:uid",
-            "team": "e.id IN (WITH RECURSIVE team(id) AS (SELECT id FROM employees WHERE tenant_id=:tid AND user_id=:uid AND deleted_at IS NULL UNION ALL SELECT e2.id FROM employees e2 JOIN team t ON e2.manager_id=t.id WHERE e2.tenant_id=:tid AND e2.deleted_at IS NULL) SELECT id FROM team)",
-            "department": "e.department_id IN (WITH RECURSIVE dept(id) AS (SELECT department_id FROM employees WHERE tenant_id=:tid AND user_id=:uid AND deleted_at IS NULL UNION ALL SELECT d.id FROM departments d JOIN dept x ON d.parent_id=x.id WHERE d.tenant_id=:tid AND d.deleted_at IS NULL) SELECT id FROM dept)",
-        }[scope]
+        scope = await resolve_scope(db, ctx, "attendance.read") or DataScope.SELF
+        scope_clause = scope_filter(scope)
         rows = (
             (
                 await db.execute(
@@ -426,8 +392,8 @@ async def decide_correction(
                 "uid": ctx.user_id,
             },
         )
-        if not ctx.can("attendance.manage") and not assigned:
-            raise Forbidden(details={"permission": "attendance.manage", "reason": "not_assigned_approver"})
+        if not ctx.can("attendance.approve") and not assigned:
+            raise Forbidden(details={"permission": "attendance.approve", "reason": "not_assigned_approver"})
         now = datetime.now(UTC)
         updated = (
             (

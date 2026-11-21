@@ -7,14 +7,48 @@ import uuid
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.context import RequestContext
 from app.core.config import get_settings
+from app.core.context import RequestContext
 from app.core.errors import Conflict, NotFound, ValidationFailed
+from app.core.redis import get_redis, perms_key
 
 
 def _require_teams() -> None:
     if not get_settings().feature_teams:
         raise NotFound("Teams are disabled", code="feature.teams_disabled")
+
+
+async def _ensure_manager_role(db: AsyncSession, ctx: RequestContext, employee_id: uuid.UUID | None) -> None:
+    if employee_id is None:
+        return
+    user_id = await db.scalar(
+        text(
+            "SELECT user_id FROM employees WHERE tenant_id=:tid AND id=:eid "
+            "AND user_id IS NOT NULL AND deleted_at IS NULL"
+        ),
+        {"tid": ctx.tenant_id, "eid": employee_id},
+    )
+    if user_id is None:
+        return
+    role_id = await db.scalar(
+        text("SELECT id FROM roles WHERE tenant_id IS NULL AND name='Manager'"),
+    )
+    if role_id is None:
+        return
+    inserted = await db.scalar(
+        text(
+            """INSERT INTO user_roles(tenant_id,user_id,role_id,granted_by)
+               VALUES (:tid,:uid,:rid,:by) ON CONFLICT DO NOTHING RETURNING role_id"""
+        ),
+        {"tid": ctx.tenant_id, "uid": user_id, "rid": role_id, "by": ctx.user_id},
+    )
+    if inserted is not None:
+        await _audit(
+            db, ctx, "role.auto_assigned", "role", role_id,
+            after={"user_id": str(user_id), "role": "Manager", "reason": "managed_people"},
+        )
+        if get_settings().redis_enabled:
+            await get_redis().delete(perms_key(ctx.tenant_id, user_id))
 
 
 async def _validate_team_refs(db: AsyncSession, tenant_id: uuid.UUID, data: dict) -> None:
@@ -90,6 +124,7 @@ async def create_team(db: AsyncSession, ctx: RequestContext, data: dict) -> dict
             if "duplicate" in str(exc).lower() or "unique" in str(exc).lower():
                 raise Conflict("Team name or code already exists", code="team.duplicate") from exc
             raise
+        await _ensure_manager_role(db, ctx, row["manager_employee_id"])
     return dict(row)
 
 
@@ -113,6 +148,7 @@ async def update_team(
             ), {**changes, "tid": ctx.tenant_id, "id": team_id})).mappings().one()
         else:
             row = current
+        await _ensure_manager_role(db, ctx, row["manager_employee_id"])
     return dict(row)
 
 
@@ -228,7 +264,7 @@ async def get_resource(
 
 async def departments(db: AsyncSession, ctx: RequestContext) -> list[dict]:
     ctx.require("tenant.read")
-    if ctx.can("tenant.update"):
+    if ctx.can("departments.manage"):
         return await _list(db, ctx, "departments", "tenant.read")
     async with db.begin():
         rows = (
@@ -326,21 +362,20 @@ async def _can_manage_department(
     department_id: uuid.UUID,
     require_update: bool = False,
 ) -> None:
-    if ctx.can("tenant.update"):
+    if ctx.can("departments.manage"):
         return
     if require_update and not ctx.can("employees.update"):
-        manager_role = await db.scalar(
-            text("""SELECT EXISTS(
-                        SELECT 1
-                        FROM user_roles ur
-                        JOIN roles r ON r.id=ur.role_id
-                        WHERE ur.tenant_id=:tid AND ur.user_id=:uid
-                          AND r.tenant_id IS NULL
-                          AND r.name IN ('Department Manager', 'People Manager')
-                    )"""),
-            {"tid": ctx.tenant_id, "uid": ctx.user_id},
+        managed_department = await db.scalar(
+            text(
+                """SELECT EXISTS(
+                     SELECT 1 FROM departments d
+                     JOIN employees e ON e.tenant_id=d.tenant_id AND e.id=d.manager_id
+                     WHERE d.tenant_id=:tid AND d.id=:did AND e.user_id=:uid
+                       AND d.deleted_at IS NULL AND e.deleted_at IS NULL)"""
+            ),
+            {"tid": ctx.tenant_id, "did": department_id, "uid": ctx.user_id},
         )
-        if not manager_role:
+        if not managed_department:
             ctx.require("employees.update")
     else:
         ctx.require("employees.read")
@@ -443,7 +478,7 @@ async def remove_department_employee(
 
 
 async def create_department(db: AsyncSession, ctx: RequestContext, data: dict) -> dict:
-    ctx.require("tenant.update")
+    ctx.require("departments.manage")
     data["code"] = data.get("code") or None
     if not data.get("code"):
         words = re.findall(r"[A-Za-z0-9]+", data["name"].upper())
@@ -477,13 +512,14 @@ async def create_department(db: AsyncSession, ctx: RequestContext, data: dict) -
             .one()
         )
         await _audit(db, ctx, "department.created", "department", row["id"], after=dict(row))
+        await _ensure_manager_role(db, ctx, row["manager_id"])
     return dict(row)
 
 
 async def update_department(
     db: AsyncSession, ctx: RequestContext, entity_id: uuid.UUID, changes: dict
 ) -> dict:
-    ctx.require("tenant.update")
+    ctx.require("departments.manage")
     changes = {k: v for k, v in changes.items() if v is not None or k in {"parent_id", "manager_id"}}
     if set(changes) - {"name", "code", "parent_id", "manager_id"}:
         raise ValidationFailed()
@@ -532,11 +568,12 @@ async def update_department(
             .one()
         )
         await _audit(db, ctx, "department.updated", "department", entity_id, dict(old), dict(new))
+        await _ensure_manager_role(db, ctx, new["manager_id"])
     return dict(new)
 
 
 async def delete_department(db: AsyncSession, ctx: RequestContext, entity_id: uuid.UUID) -> None:
-    ctx.require("tenant.update")
+    ctx.require("departments.manage")
     async with db.begin():
         row = (
             (

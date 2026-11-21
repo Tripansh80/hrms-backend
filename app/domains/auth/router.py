@@ -135,7 +135,13 @@ async def me(ctx: RequestContext = Depends(get_request_context), db: AsyncSessio
         )
     if row is None:
         raise Unauthorized()
-    return {**dict(row), "roles": role_names, "permissions": sorted(ctx.permissions)}
+    if row["is_owner"] and "Admin" not in role_names:
+        role_names.append("Admin")
+    permissions = set(ctx.permissions)
+    if row["is_owner"]:
+        role_names = sorted(set(role_names) | {"Admin"})
+        permissions.add("dashboard.admin")
+    return {**dict(row), "roles": role_names, "permissions": sorted(permissions)}
 
 
 @router.post("/accept-invite", status_code=204)

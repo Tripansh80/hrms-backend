@@ -187,7 +187,7 @@ async def update_membership(db: AsyncSession, ctx: RequestContext, user_id: uuid
                 {"tid": ctx.tenant_id},
             )
             if owners <= 1:
-                raise Conflict("The last Tenant Owner cannot be suspended", code="membership.last_owner")
+                raise Conflict("The last Admin cannot be suspended", code="membership.last_admin")
         await db.execute(
             text("UPDATE tenant_memberships SET status=:status WHERE tenant_id=:tid AND user_id=:uid"),
             {"status": status, "tid": ctx.tenant_id, "uid": user_id},
@@ -243,7 +243,7 @@ async def remove_membership(db: AsyncSession, ctx: RequestContext, user_id: uuid
                 {"tid": ctx.tenant_id},
             )
             if count <= 1:
-                raise Conflict("The last Tenant Owner cannot be removed", code="membership.last_owner")
+                raise Conflict("The last Admin cannot be removed", code="membership.last_admin")
         await db.execute(
             text("UPDATE tenant_memberships SET status='removed' WHERE tenant_id=:tid AND user_id=:uid"),
             {"tid": ctx.tenant_id, "uid": user_id},

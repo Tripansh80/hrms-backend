@@ -18,7 +18,10 @@ _EFFECTIVE_PERMISSIONS = text(
            ) AS codes
     FROM tenant_memberships m
     LEFT JOIN user_roles ur       ON ur.tenant_id = m.tenant_id AND ur.user_id = m.user_id
-    LEFT JOIN roles r             ON r.id = ur.role_id AND (r.tenant_id IS NULL OR r.tenant_id = m.tenant_id)
+    LEFT JOIN roles r             ON (
+      r.id = ur.role_id
+      OR (m.is_owner AND r.tenant_id IS NULL AND r.name = 'Admin')
+    ) AND (r.tenant_id IS NULL OR r.tenant_id = m.tenant_id)
     LEFT JOIN role_permissions rp ON rp.role_id = r.id
     LEFT JOIN permissions p       ON p.id = rp.permission_id
     WHERE m.tenant_id = :tenant_id AND m.user_id = :user_id

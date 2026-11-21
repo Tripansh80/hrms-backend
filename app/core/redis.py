@@ -32,4 +32,4 @@ def tenant_slug_key(slug: str) -> str:
 
 def perms_key(tenant_id: uuid.UUID, user_id: uuid.UUID) -> str:
     """Delete on every role / membership change (M1, M2). TTL 5 min is only a backstop."""
-    return f"t:{tenant_id}:perms:{user_id}"
+    return f"t:{tenant_id}:perms:v2:{user_id}"

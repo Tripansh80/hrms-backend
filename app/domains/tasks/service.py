@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.context import RequestContext
 from app.core.errors import Forbidden, NotFound
+from app.core.permissions import DataScope, resolve_scope
 
 
 async def _can_manage_employee(db: AsyncSession, ctx: RequestContext, employee_id: uuid.UUID) -> bool:
@@ -26,17 +27,7 @@ async def _can_manage_employee(db: AsyncSession, ctx: RequestContext, employee_i
 
 async def list_tasks(db: AsyncSession, ctx: RequestContext, assigned_only: bool = False) -> list[dict]:
     ctx.require("employees.read")
-    is_employee = bool(
-        await db.scalar(
-            text("""SELECT EXISTS(
-                    SELECT 1 FROM user_roles ur
-                    JOIN roles r ON r.id=ur.role_id
-                    WHERE ur.tenant_id=:tid AND ur.user_id=:uid
-                      AND r.tenant_id IS NULL AND r.name='Employee'
-                )"""),
-            {"tid": ctx.tenant_id, "uid": ctx.user_id},
-        )
-    )
+    is_employee = (await resolve_scope(db, ctx, "employees.read")) is DataScope.SELF
     visibility_clause = """
         e.user_id=:uid AND (
             EXISTS (SELECT 1 FROM tenant_memberships creator_membership
@@ -48,7 +39,8 @@ async def list_tasks(db: AsyncSession, ctx: RequestContext, assigned_only: bool 
                        JOIN roles creator_role ON creator_role.id=creator_roles.role_id
                        WHERE creator_roles.tenant_id=:tid
                          AND creator_roles.user_id=t.created_by
-                         AND creator_role.name IN ('HR Admin', 'HR Manager'))
+                         AND creator_role.data_scope='all'
+                         AND creator_role.is_system)
         )
     """ if assigned_only and not is_employee else """
         e.user_id=:uid

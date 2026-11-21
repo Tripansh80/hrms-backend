@@ -60,7 +60,7 @@ async def list_leave_types(db: AsyncSession, ctx: RequestContext) -> list[dict]:
 async def update_leave_type(
     db: AsyncSession, ctx: RequestContext, leave_type_id: uuid.UUID, values: dict
 ) -> dict:
-    ctx.require("tenant.update")
+    ctx.require("attendance.manage")
     if not values:
         raise ValidationFailed("At least one leave policy field is required", code="leave.policy_empty")
     rules = {
@@ -141,7 +141,7 @@ async def list_approvers(db: AsyncSession, ctx: RequestContext) -> list[dict]:
         return []
     result = await db.execute(
         text("""WITH eligible AS (
-                    SELECT manager.user_id, 'Department Manager' AS role_name, 1 AS priority
+                    SELECT manager.user_id, 'Manager' AS role_name, 1 AS priority
                     FROM employees subject
                     JOIN departments d ON d.tenant_id=subject.tenant_id
                       AND d.id=subject.department_id AND d.deleted_at IS NULL
@@ -156,7 +156,7 @@ async def list_approvers(db: AsyncSession, ctx: RequestContext) -> list[dict]:
                     JOIN permissions permission ON permission.id=rp.permission_id
                     WHERE ur.tenant_id=:tid
                       AND permission.code='leave.approve'
-                      AND role.name IN ('HR Admin', 'HR Manager')
+                      AND role.data_scope='all'
                     UNION
                     SELECT membership.user_id, 'Company Owner', 3
                     FROM tenant_memberships membership
@@ -361,7 +361,7 @@ async def create_request(db: AsyncSession, ctx: RequestContext, values: dict) ->
                             JOIN permissions permission ON permission.id=rp.permission_id
                             WHERE ur.tenant_id=:tid
                               AND permission.code='leave.approve'
-                              AND role.name IN ('HR Admin', 'HR Manager')
+                              AND role.data_scope='all'
                             UNION
                             SELECT membership.user_id
                             FROM tenant_memberships membership
@@ -514,7 +514,7 @@ async def decide_request(
         request = await _get_request(db, ctx, request_id, lock=True)
         if request["status"] != "pending":
             raise Conflict("Only pending leave requests can be decided", code="leave.request_not_pending")
-        if request["current_approver_id"] and request["current_approver_id"] != ctx.user_id:
+        if request["current_approver_id"] and request["current_approver_id"] != ctx.user_id and not await _is_owner(db, ctx):
             raise Forbidden(details={"permission": "leave.approve"})
         row = (
             (

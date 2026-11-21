@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.context import RequestContext
 from app.core.errors import Conflict, FeatureDisabled, Forbidden, NotFound, PlanLimitReached, ValidationFailed
+from app.core.permissions import DataScope, resolve_scope, scope_filter
 from app.core.security import generate_opaque_token, hash_password, hash_token
 from app.domains.notifications import service as notification_service
 
@@ -34,87 +35,6 @@ _FIELDS = {
 def _require_feature(name: str, enabled: bool) -> None:
     if not enabled:
         raise FeatureDisabled(details={"feature": name})
-
-
-async def _scope(db: AsyncSession, ctx: RequestContext, permission: str = "employees.read") -> str:
-    manager_role = await db.scalar(
-        text("""SELECT EXISTS(
-                    SELECT 1 FROM user_roles ur
-                    JOIN roles r ON r.id=ur.role_id
-                    WHERE ur.tenant_id=:tid AND ur.user_id=:uid
-                      AND r.tenant_id IS NULL
-                      AND r.name IN ('Department Manager', 'People Manager')
-                )"""),
-        {"tid": ctx.tenant_id, "uid": ctx.user_id},
-    )
-    if manager_role:
-        return "department"
-    employee_role = await db.scalar(
-        text("""SELECT EXISTS(
-                    SELECT 1 FROM user_roles ur
-                    JOIN roles r ON r.id=ur.role_id
-                    WHERE ur.tenant_id=:tid AND ur.user_id=:uid
-                      AND r.tenant_id IS NULL AND r.name='Employee'
-                )"""),
-        {"tid": ctx.tenant_id, "uid": ctx.user_id},
-    )
-    if employee_role:
-        return "department"
-    scopes = (
-        (
-            await db.execute(
-                text("""SELECT r.data_scope FROM user_roles ur JOIN roles r ON r.id=ur.role_id
-      JOIN role_permissions rp ON rp.role_id=r.id JOIN permissions p ON p.id=rp.permission_id
-      WHERE ur.tenant_id=:tid AND ur.user_id=:uid AND p.code=:permission"""),
-                {"tid": ctx.tenant_id, "uid": ctx.user_id, "permission": permission},
-            )
-        )
-        .scalars()
-        .all()
-    )
-    if not scopes:
-        ctx.require(permission)
-        return "self"
-    return max(scopes, key={"self": 1, "team": 2, "department": 3, "all": 4}.get)
-
-
-def _scope_clause(scope: str) -> str:
-    if scope == "all":
-        return "TRUE"
-    if scope == "self":
-        return "e.user_id=:uid"
-    if scope == "team":
-        return "e.id IN (WITH RECURSIVE team(id) AS (SELECT id FROM employees WHERE tenant_id=:tid AND user_id=:uid AND deleted_at IS NULL UNION ALL SELECT e2.id FROM employees e2 JOIN team t ON e2.manager_id=t.id WHERE e2.tenant_id=:tid AND e2.deleted_at IS NULL) SELECT id FROM team)"
-    return """e.id IN (
-        WITH RECURSIVE dept(id) AS (
-            SELECT department_id
-            FROM employees
-            WHERE tenant_id=:tid AND user_id=:uid AND deleted_at IS NULL
-            UNION
-            SELECT d.id
-            FROM departments d
-            JOIN employees manager
-              ON manager.tenant_id=d.tenant_id
-             AND manager.id=d.manager_id
-             AND manager.user_id=:uid
-             AND manager.deleted_at IS NULL
-            WHERE d.tenant_id=:tid AND d.deleted_at IS NULL
-            UNION ALL
-            SELECT child.id
-            FROM departments child
-            JOIN dept parent ON child.parent_id=parent.id
-            WHERE child.tenant_id=:tid AND child.deleted_at IS NULL
-        )
-        SELECT member.id
-        FROM employees member
-        JOIN dept ON dept.id=member.department_id
-        WHERE member.tenant_id=:tid AND member.deleted_at IS NULL
-        UNION
-        SELECT d.manager_id
-        FROM departments d
-        JOIN dept ON dept.id=d.id
-        WHERE d.tenant_id=:tid AND d.deleted_at IS NULL AND d.manager_id IS NOT NULL
-    )"""
 
 
 async def _audit(
@@ -261,12 +181,13 @@ async def _start_onboarding_workflow(db: AsyncSession, ctx: RequestContext, empl
 async def list_employees(db: AsyncSession, ctx: RequestContext, limit: int, cursor: uuid.UUID | None) -> dict:
     ctx.require("employees.read")
     async with db.begin():
-        scope = await _scope(db, ctx)
+        scope = await resolve_scope(db, ctx, "employees.read") or DataScope.SELF
         rows = (
             (
                 await db.execute(
                     text(f"""SELECT e.id,e.employee_no,e.first_name,e.last_name,e.email,e.phone,e.department_id,
           e.manager_id,e.team_id,e.location_id,e.work_schedule_id,e.designation,e.employment_type,e.status,e.joining_date,e.exit_date,e.user_id,
+          COALESCE(tm.is_owner, FALSE) AS is_owner,
           CASE WHEN e.user_id IS NULL THEN 'not_invited'
                WHEN tm.status = 'invited' THEN 'invited'
                WHEN tm.status = 'active' THEN 'active'
@@ -277,7 +198,7 @@ async def list_employees(db: AsyncSession, ctx: RequestContext, limit: int, curs
           LEFT JOIN departments d ON d.tenant_id=e.tenant_id AND d.id=e.department_id AND d.deleted_at IS NULL
           LEFT JOIN employees manager ON manager.tenant_id=e.tenant_id AND manager.id=e.manager_id AND manager.deleted_at IS NULL
           LEFT JOIN tenant_memberships tm ON tm.tenant_id=e.tenant_id AND tm.user_id=e.user_id
-          WHERE e.tenant_id=:tid AND e.deleted_at IS NULL AND ({_scope_clause(scope)})
+          WHERE e.tenant_id=:tid AND e.deleted_at IS NULL AND ({scope_filter(scope)})
           AND (CAST(:cursor AS uuid) IS NULL OR e.id>CAST(:cursor AS uuid)) ORDER BY e.id LIMIT :limit"""),
                     {"tid": ctx.tenant_id, "uid": ctx.user_id, "cursor": cursor, "limit": limit + 1},
                 )
@@ -292,12 +213,13 @@ async def list_employees(db: AsyncSession, ctx: RequestContext, limit: int, curs
 async def get_employee(db: AsyncSession, ctx: RequestContext, employee_id: uuid.UUID) -> dict:
     ctx.require("employees.read")
     async with db.begin():
-        scope = await _scope(db, ctx)
+        scope = await resolve_scope(db, ctx, "employees.read") or DataScope.SELF
         row = (
             (
                 await db.execute(
                     text(f"""SELECT e.id,e.employee_no,e.first_name,e.last_name,e.email,e.phone,e.department_id,
           e.manager_id,e.team_id,e.location_id,e.work_schedule_id,e.designation,e.employment_type,e.status,e.joining_date,e.exit_date,e.user_id,
+          COALESCE(tm.is_owner, FALSE) AS is_owner,
           CASE WHEN e.user_id IS NULL THEN 'not_invited'
                WHEN tm.status = 'invited' THEN 'invited'
                WHEN tm.status = 'active' THEN 'active'
@@ -308,7 +230,7 @@ async def get_employee(db: AsyncSession, ctx: RequestContext, employee_id: uuid.
           LEFT JOIN departments d ON d.tenant_id=e.tenant_id AND d.id=e.department_id AND d.deleted_at IS NULL
           LEFT JOIN employees manager ON manager.tenant_id=e.tenant_id AND manager.id=e.manager_id AND manager.deleted_at IS NULL
           LEFT JOIN tenant_memberships tm ON tm.tenant_id=e.tenant_id AND tm.user_id=e.user_id
-          WHERE e.tenant_id=:tid AND e.id=:id AND e.deleted_at IS NULL AND ({_scope_clause(scope)})"""),
+          WHERE e.tenant_id=:tid AND e.id=:id AND e.deleted_at IS NULL AND ({scope_filter(scope)})"""),
                     {"tid": ctx.tenant_id, "uid": ctx.user_id, "id": employee_id},
                 )
             )
@@ -325,6 +247,11 @@ async def get_profile(db: AsyncSession, ctx: RequestContext, employee_id: uuid.U
     employee = await get_employee(db, ctx, employee_id)
     history_items = await history(db, ctx, employee_id)
     async with db.begin():
+        if employee.get("department_id") and not employee.get("department_name"):
+            employee["department_name"] = await db.scalar(
+                text("SELECT name FROM departments WHERE tenant_id=:tid AND id=:did"),
+                {"tid": ctx.tenant_id, "did": employee["department_id"]},
+            )
         roles = (
             await db.execute(
                 text("""SELECT r.id,r.name FROM user_roles ur JOIN roles r ON r.id=ur.role_id
@@ -403,13 +330,17 @@ async def transfer_employee(
              "old": json.dumps({key: old[key] for key in changes}, default=str),
              "new": json.dumps({key: new[key] for key in changes}, default=str), "uid": ctx.user_id},
         )
+        if "manager_id" in changes:
+            from app.domains.organization.service import _ensure_manager_role
+
+            await _ensure_manager_role(db, ctx, changes["manager_id"])
     return await get_employee(db, ctx, employee_id)
 
 
 async def create_employee(db: AsyncSession, ctx: RequestContext, data: dict) -> dict:
     ctx.require("employees.create")
     invitations_enabled = get_settings().feature_employee_invitations
-    send_invitation = data.pop("send_invitation", False)
+    data.pop("send_invitation", False)
     role_ids = list(dict.fromkeys(data.pop("role_ids", [])))
     if invitations_enabled and role_ids:
         raise ValidationFailed(
@@ -418,23 +349,12 @@ async def create_employee(db: AsyncSession, ctx: RequestContext, data: dict) -> 
         )
     if invitations_enabled:
         role_ids = []
-    else:
-        send_invitation = True
     if role_ids:
         ctx.require("roles.manage")
     async with db.begin():
-        scope = await _scope(db, ctx, "employees.create")
-        if scope != "all":
-            actor_department = await db.scalar(
-                text("""SELECT department_id FROM employees
-                        WHERE tenant_id=:tid AND user_id=:uid AND deleted_at IS NULL"""),
-                {"tid": ctx.tenant_id, "uid": ctx.user_id},
-            )
-            if actor_department is None or data.get("department_id") != actor_department:
-                raise Forbidden(
-                    "You may only add employees to your department",
-                    code="employee.department_scope",
-                )
+        scope = await resolve_scope(db, ctx, "employees.create")
+        if scope is not DataScope.ALL:
+            raise Forbidden("Only all-scope users may create employees", code="employee.scope")
         await db.execute(text("SELECT id FROM tenants WHERE id=:tid FOR UPDATE"), {"tid": ctx.tenant_id})
         await _validate_employee_refs(db, ctx.tenant_id, data)
         current = await db.scalar(
@@ -641,13 +561,15 @@ async def update_employee(
     if set(changes) - _FIELDS:
         raise ValidationFailed()
     async with db.begin():
-        scope = await _scope(db, ctx, "employees.update") if ctx.can("employees.update") else "self"
+        scope = (
+            await resolve_scope(db, ctx, "employees.update") if ctx.can("employees.update") else DataScope.SELF
+        ) or DataScope.SELF
         old = (
             (
                 await db.execute(
                     text(
                         "SELECT e.* FROM employees e WHERE e.tenant_id=:tid AND e.id=:id AND e.deleted_at IS NULL AND ("
-                        + _scope_clause(scope)
+                        + scope_filter(scope)
                         + ") FOR UPDATE"
                     ),
                     {"tid": ctx.tenant_id, "id": employee_id, "uid": ctx.user_id},
@@ -840,13 +762,13 @@ async def update_employee(
 async def delete_employee(db: AsyncSession, ctx: RequestContext, employee_id: uuid.UUID) -> None:
     ctx.require("employees.delete")
     async with db.begin():
-        scope = await _scope(db, ctx, "employees.delete")
+        scope = await resolve_scope(db, ctx, "employees.delete") or DataScope.SELF
         row = (
             (
                 await db.execute(
                     text(
                         "SELECT e.id,e.status FROM employees e WHERE e.tenant_id=:tid AND e.id=:id AND e.deleted_at IS NULL AND ("
-                        + _scope_clause(scope)
+                        + scope_filter(scope)
                         + ") FOR UPDATE"
                     ),
                     {"tid": ctx.tenant_id, "id": employee_id, "uid": ctx.user_id},
@@ -879,12 +801,12 @@ async def invite_employee(db: AsyncSession, ctx: RequestContext, employee_id: uu
     ctx.require("employees.update")
     token = generate_opaque_token()
     async with db.begin():
-        scope = await _scope(db, ctx, "employees.update")
+        scope = await resolve_scope(db, ctx, "employees.update") or DataScope.SELF
         employee = (
             (
                 await db.execute(
                     text("""SELECT id,user_id,email,first_name,last_name FROM employees
-          WHERE tenant_id=:tid AND id=:id AND deleted_at IS NULL AND (""" + _scope_clause(scope) + """) FOR UPDATE"""),
+          WHERE tenant_id=:tid AND id=:id AND deleted_at IS NULL AND (""" + scope_filter(scope) + """) FOR UPDATE"""),
                     {"tid": ctx.tenant_id, "id": employee_id, "uid": ctx.user_id},
                 )
             )
@@ -968,7 +890,7 @@ async def history(db: AsyncSession, ctx: RequestContext, employee_id: uuid.UUID)
         employee = await db.scalar(
             text(
                 "SELECT EXISTS(SELECT 1 FROM employees e WHERE e.tenant_id=:tid AND e.id=:id AND ("
-                + _scope_clause(await _scope(db, ctx))
+                + scope_filter(await resolve_scope(db, ctx, "employees.read") or DataScope.SELF)
                 + "))"
             ),
             {"tid": ctx.tenant_id, "uid": ctx.user_id, "id": employee_id},
@@ -993,11 +915,11 @@ async def history(db: AsyncSession, ctx: RequestContext, employee_id: uuid.UUID)
 async def reports(db: AsyncSession, ctx: RequestContext, employee_id: uuid.UUID) -> list[dict]:
     ctx.require("employees.read")
     async with db.begin():
-        scope = await _scope(db, ctx)
+        scope = await resolve_scope(db, ctx, "employees.read") or DataScope.SELF
         row = await db.scalar(
             text(
                 "SELECT EXISTS(SELECT 1 FROM employees e WHERE e.tenant_id=:tid AND e.id=:id AND e.deleted_at IS NULL AND ("
-                + _scope_clause(scope)
+                + scope_filter(scope)
                 + "))"
             ),
             {"tid": ctx.tenant_id, "uid": ctx.user_id, "id": employee_id},
@@ -1013,7 +935,7 @@ async def reports(db: AsyncSession, ctx: RequestContext, employee_id: uuid.UUID)
           UNION ALL SELECT e.id,e.manager_id,e.first_name,e.last_name,e.email,e.status,t.depth+1 FROM employees e JOIN team t ON e.manager_id=t.id WHERE e.tenant_id=:tid AND e.deleted_at IS NULL)
           SELECT t.id,t.manager_id,t.first_name,t.last_name,t.email,t.status,t.depth FROM team t
           JOIN employees e ON e.id=t.id WHERE """
-                        + _scope_clause(scope)
+                        + scope_filter(scope)
                         + " ORDER BY t.depth,t.last_name,t.first_name"
                     ),
                     {"tid": ctx.tenant_id, "uid": ctx.user_id, "id": employee_id},
